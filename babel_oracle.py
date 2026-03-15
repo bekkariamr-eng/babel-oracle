@@ -905,6 +905,7 @@ def cmd_demo():
 
 
 def cmd_configure():
+    """Interactive settings menu for session TTL and OTP backend."""
     header("CONFIGURATION")
     cfg = load_config()
     print(f"  Current settings:")

@@ -76,6 +76,11 @@ def sha256_ctr_generate(seed: bytes, length: int) -> bytes:
         ctr += 1
     return out[:length]
 
+def generate_otp(seed: bytes, length: int, backend: str = "sha256-ctr") -> bytes:
+    """Generate OTP bytes using the configured backend.
+    ChaCha20 support will be added in a later step."""
+    return sha256_ctr_generate(seed, length)
+
 def xor_bytes(a: bytes, b: bytes) -> bytes:
     return bytes(x ^ y for x, y in zip(a, b))
 
@@ -246,10 +251,23 @@ def load_replay_log() -> dict:
         log = json.loads(REPLAY_LOG_PATH.read_text())
     except (json.JSONDecodeError, IOError):
         return {}
-    # Prune old entries
+    # Prune old entries (supports both legacy int timestamps and new "ts:nonce_hex" strings)
     cutoff = int(time.time()) - REPLAY_MAX_AGE
     for peer in list(log.keys()):
-        log[peer] = [ts for ts in log[peer] if ts >= cutoff]
+        kept = []
+        for entry in log[peer]:
+            if isinstance(entry, int):
+                if entry >= cutoff:
+                    kept.append(entry)
+            else:
+                # New format: "slot_ts:nonce_hex" — extract the numeric timestamp
+                try:
+                    ts = int(entry.split(":")[0])
+                    if ts >= cutoff:
+                        kept.append(entry)
+                except (ValueError, IndexError):
+                    pass  # discard malformed entries
+        log[peer] = kept
         if not log[peer]:
             del log[peer]
     return log
@@ -269,35 +287,73 @@ def get_slot_timestamp() -> int:
     """Current 60-second time slot."""
     return int(time.time()) // 60 * 60
 
-def encrypt_data(plaintext: bytes, session_key: bytes, slot_ts: int, pad: bool = True) -> bytes:
-    """Encrypt plaintext → ciphertext (framed + XOR'd with OTP)."""
+def encrypt_data(plaintext: bytes, session_key: bytes, slot_ts: int,
+                 pad: bool = True, backend: str = "sha256-ctr") -> bytes:
+    """Encrypt plaintext with per-message nonce and backend indicator."""
     frame = frame_message(plaintext, session_key, pad=pad)
-    seed = derive_slot_seed(session_key, slot_ts)
-    otp = sha256_ctr_generate(seed, len(frame))
+    nonce = os.urandom(16)
+    slot_seed = derive_slot_seed(session_key, slot_ts)
+    effective_seed = hmac.new(slot_seed, nonce, hashlib.sha256).digest()
+    otp = generate_otp(effective_seed, len(frame), backend)
     ciphertext = xor_bytes(frame, otp)
-    # Prepend slot timestamp so receiver knows which slot
-    return struct.pack(">Q", slot_ts) + ciphertext
+    backend_byte = b"\x01" if backend == "chacha20" else b"\x00"
+    # Packet: timestamp(8) || nonce(16) || backend(1) || ciphertext
+    return struct.pack(">Q", slot_ts) + nonce + backend_byte + ciphertext
 
 def decrypt_data(packet: bytes, session_key: bytes,
                  peer_name: str = None, replay_log: dict = None) -> Optional[bytes]:
-    """Decrypt packet → plaintext (extract slot, generate OTP, XOR, verify).
-    Optionally checks and records replay protection."""
+    """Decrypt packet. Supports new format (nonce+backend) and legacy (no nonce)."""
     if len(packet) < 8:
         return None
     slot_ts = struct.unpack(">Q", packet[:8])[0]
 
-    # Replay check
+    # Try new format: timestamp(8) || nonce(16) || backend(1) || ciphertext
+    if len(packet) > 25:
+        nonce = packet[8:24]
+        nonce_hex = nonce.hex()
+        backend_byte = packet[24]
+        ciphertext = packet[25:]
+        backend = "chacha20" if backend_byte == 0x01 else "sha256-ctr"
+
+        # Replay check (new format: "slot_ts:nonce_hex")
+        replay_key = f"{slot_ts}:{nonce_hex}"
+        if peer_name and replay_log is not None:
+            if replay_key in replay_log.get(peer_name, []):
+                return None
+
+        slot_seed = derive_slot_seed(session_key, slot_ts)
+        effective_seed = hmac.new(slot_seed, nonce, hashlib.sha256).digest()
+        otp = generate_otp(effective_seed, len(ciphertext), backend)
+        frame = xor_bytes(ciphertext, otp)
+        result = unframe_message(frame, session_key)
+
+        if result is not None:
+            if peer_name and replay_log is not None:
+                replay_log.setdefault(peer_name, []).append(replay_key)
+            return result
+
+        # If declared backend didn't work, try the other backend
+        alt_backend = "sha256-ctr" if backend == "chacha20" else "chacha20"
+        otp = generate_otp(effective_seed, len(ciphertext), alt_backend)
+        frame = xor_bytes(ciphertext, otp)
+        result = unframe_message(frame, session_key)
+
+        if result is not None:
+            if peer_name and replay_log is not None:
+                replay_log.setdefault(peer_name, []).append(replay_key)
+            return result
+
+    # Fallback: legacy format (no nonce, no backend) — timestamp(8) || ciphertext
+    ciphertext = packet[8:]
     if peer_name and replay_log is not None:
         if slot_ts in replay_log.get(peer_name, []):
-            return None  # replay detected
+            return None
 
-    ciphertext = packet[8:]
-    seed = derive_slot_seed(session_key, slot_ts)
-    otp = sha256_ctr_generate(seed, len(ciphertext))
+    slot_seed = derive_slot_seed(session_key, slot_ts)
+    otp = sha256_ctr_generate(slot_seed, len(ciphertext))
     frame = xor_bytes(ciphertext, otp)
     result = unframe_message(frame, session_key)
 
-    # Record successful decryption for replay protection
     if result is not None and peer_name and replay_log is not None:
         replay_log.setdefault(peer_name, []).append(slot_ts)
 
@@ -573,9 +629,18 @@ def cmd_decrypt_message():
     elapsed = time.perf_counter() - t0
 
     if plaintext is None:
-        # Check if it was a replay
         slot_ts = struct.unpack(">Q", packet[:8])[0] if len(packet) >= 8 else 0
-        if slot_ts in replay_log.get(peer_name, []):
+        peer_entries = replay_log.get(peer_name, [])
+        # Check both new format (string) and old format (int)
+        is_replay = False
+        if len(packet) > 24:
+            nonce_hex = packet[8:24].hex()
+            replay_key = f"{slot_ts}:{nonce_hex}"
+            is_replay = replay_key in peer_entries
+        if not is_replay:
+            is_replay = slot_ts in peer_entries
+
+        if is_replay:
             print(f"\n  REPLAY DETECTED! This message has already been received.")
         else:
             print(f"\n  DECRYPTION FAILED!")

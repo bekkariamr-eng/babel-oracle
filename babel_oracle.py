@@ -493,20 +493,33 @@ def cmd_encrypt_message():
     out_path.write_text(encoded)
     print(f"\n  Saved to: {out_path}")
 
-    print(f"\n  ─── CIPHERTEXT ───")
+    print(f"\n  {'─'*60}")
+    print(f"  CIPHERTEXT (copy the line below)")
+    print(f"  {'─'*60}")
     print(f"\n{encoded}\n")
+    print(f"  {'─'*60}")
 
-    # Auto-copy to clipboard
+    # Auto-copy to clipboard (platform-aware)
+    copied = False
     try:
         import subprocess
         if os.name == "nt":
             subprocess.run("clip", input=encoded.encode(), check=True)
+            copied = True
+        elif sys.platform == "darwin":
+            subprocess.run("pbcopy", input=encoded.encode(), check=True)
+            copied = True
         else:
             subprocess.run(["xclip", "-selection", "clipboard"],
                            input=encoded.encode(), check=True)
-        print(f"  Copied to clipboard!")
+            copied = True
     except Exception:
-        print(f"  (Could not auto-copy — please copy manually)")
+        pass
+
+    if copied:
+        print(f"  [OK] Auto-copied to clipboard!")
+    else:
+        print(f"  [!] Could not auto-copy. Please select and copy manually.")
 
     ent = entropy_per_byte(packet[8:])  # skip timestamp header
     print(f"\n  Entropy: {ent:.2f} bits/byte (ciphertext is indistinguishable from noise)")

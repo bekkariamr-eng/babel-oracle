@@ -134,11 +134,42 @@ class SHA256_CTR_OTP:
         self.buffer = b""
 
 
+class ChaCha20_OTP:
+    """
+    Deterministic OTP generator using ChaCha20 stream cipher.
+    Same interface as SHA256_CTR_OTP but ~100x faster via OpenSSL.
+    """
+
+    def __init__(self, seed: bytes):
+        assert len(seed) == 32, "Seed must be 32 bytes"
+        from cryptography.hazmat.primitives.ciphers import Cipher
+        from cryptography.hazmat.primitives.ciphers.algorithms import ChaCha20
+        key = hkdf_expand(seed, b"chacha20-key", 32)
+        nonce = hkdf_expand(seed, b"chacha20-nonce", 16)
+        algorithm = ChaCha20(key, nonce)
+        self._cipher = Cipher(algorithm, mode=None)
+        self._encryptor = self._cipher.encryptor()
+        self._seed = seed
+        self._key = key
+        self._nonce = nonce
+
+    def generate(self, length: int) -> bytes:
+        """Generate `length` bytes of keystream. Maintains state across calls."""
+        return self._encryptor.update(b"\x00" * length)
+
+    def reset(self):
+        """Reset to beginning of stream."""
+        from cryptography.hazmat.primitives.ciphers import Cipher
+        from cryptography.hazmat.primitives.ciphers.algorithms import ChaCha20
+        algorithm = ChaCha20(self._key, self._nonce)
+        self._cipher = Cipher(algorithm, mode=None)
+        self._encryptor = self._cipher.encryptor()
+
+
 def get_otp_generator(seed: bytes, backend: str = "sha256-ctr"):
     """Factory: create an OTP generator by backend name."""
     if backend == "chacha20":
-        # ChaCha20 will be added in a later step; for now fall back to SHA256
-        return SHA256_CTR_OTP(seed)
+        return ChaCha20_OTP(seed)
     return SHA256_CTR_OTP(seed)
 
 

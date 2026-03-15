@@ -134,6 +134,14 @@ class SHA256_CTR_OTP:
         self.buffer = b""
 
 
+def get_otp_generator(seed: bytes, backend: str = "sha256-ctr"):
+    """Factory: create an OTP generator by backend name."""
+    if backend == "chacha20":
+        # ChaCha20 will be added in a later step; for now fall back to SHA256
+        return SHA256_CTR_OTP(seed)
+    return SHA256_CTR_OTP(seed)
+
+
 # =============================================================================
 # 4. XOR ENCRYPTION (Vernam cipher)
 # =============================================================================
@@ -211,7 +219,7 @@ def unframe_message(frame: bytes, session_key: bytes) -> Optional[bytes]:
 class Party:
     """
     A protocol participant (Alice or Bob).
-    
+
     Holds key material and can encrypt/decrypt messages in a given time slot.
     """
     name: str
@@ -219,6 +227,7 @@ class Party:
     master_key: Optional[bytes] = None
     session_key: Optional[bytes] = None
     _session_id: int = 0
+    backend: str = "sha256-ctr"
 
     @property
     def public_key(self) -> bytes:
@@ -235,25 +244,54 @@ class Party:
         self._session_id = session_id
         self.session_key = derive_session_key(self.master_key, session_id)
 
-    def get_otp(self, slot_timestamp: int, length: int) -> bytes:
+    def get_otp(self, slot_timestamp: int, length: int, seed_override: bytes = None) -> bytes:
         """Phase 1b: Generate OTP for a given time slot."""
         assert self.session_key is not None, "Call open_session first"
-        seed = derive_slot_seed(self.session_key, slot_timestamp)
-        gen = SHA256_CTR_OTP(seed)
+        seed = seed_override or derive_slot_seed(self.session_key, slot_timestamp)
+        gen = get_otp_generator(seed, self.backend)
         return gen.generate(length)
 
     def encrypt(self, plaintext: bytes, slot_timestamp: int, pad: bool = True) -> bytes:
-        """Phase 2: Frame + encrypt a message."""
+        """Phase 2: Frame + encrypt with per-message nonce and backend byte."""
         frame = frame_message(plaintext, self.session_key, pad=pad)
-        otp = self.get_otp(slot_timestamp, len(frame))
-        return xor_bytes(frame, otp)
+        nonce = os.urandom(16)
+        seed = derive_slot_seed(self.session_key, slot_timestamp)
+        effective_seed = hmac.new(seed, nonce, hashlib.sha256).digest()
+        gen = get_otp_generator(effective_seed, self.backend)
+        otp = gen.generate(len(frame))
+        ciphertext = xor_bytes(frame, otp)
+        backend_byte = b"\x01" if self.backend == "chacha20" else b"\x00"
+        return nonce + backend_byte + ciphertext
 
     def decrypt(self, ciphertext: bytes, slot_timestamp: int,
                 seen_slots: set = None) -> Optional[bytes]:
-        """Phase 4: Decrypt + verify a message. Optionally reject replays."""
+        """Phase 4: Decrypt + verify. Supports nonce+backend and legacy formats."""
+        # Try new format: nonce(16) || backend(1) || ciphertext
+        if len(ciphertext) > 17:
+            nonce = ciphertext[:16]
+            backend_byte = ciphertext[16]
+            ct = ciphertext[17:]
+            backend = "chacha20" if backend_byte == 0x01 else "sha256-ctr"
+            replay_key = f"{slot_timestamp}:{nonce.hex()}"
+            if seen_slots is not None and replay_key in seen_slots:
+                return None
+            seed = derive_slot_seed(self.session_key, slot_timestamp)
+            effective_seed = hmac.new(seed, nonce, hashlib.sha256).digest()
+            gen = get_otp_generator(effective_seed, backend)
+            otp = gen.generate(len(ct))
+            frame = xor_bytes(ct, otp)
+            result = unframe_message(frame, self.session_key)
+            if result is not None:
+                if seen_slots is not None:
+                    seen_slots.add(replay_key)
+                return result
+
+        # Fallback: legacy format (no nonce, no backend byte)
         if seen_slots is not None and slot_timestamp in seen_slots:
             return None
-        otp = self.get_otp(slot_timestamp, len(ciphertext))
+        seed = derive_slot_seed(self.session_key, slot_timestamp)
+        gen = SHA256_CTR_OTP(seed)
+        otp = gen.generate(len(ciphertext))
         frame = xor_bytes(ciphertext, otp)
         result = unframe_message(frame, self.session_key)
         if result is not None and seen_slots is not None:

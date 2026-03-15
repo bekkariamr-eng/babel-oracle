@@ -223,6 +223,26 @@ def main():
 
     kv("Seen slots", f"{seen_slots}")
 
+    # Test multi-message in same slot (nonce prevents OTP reuse)
+    section("PHASE 3d — Multi-Message Same Slot (Nonce)")
+
+    msg_1 = "First message in this slot".encode()
+    msg_2 = "Second message in this slot".encode()
+
+    ct_1 = alice.encrypt(msg_1, slot_timestamp)
+    ct_2 = alice.encrypt(msg_2, slot_timestamp)
+
+    assert ct_1 != ct_2, "Same-slot messages should produce different ciphertext"
+    ok("Different ciphertext for same slot (nonce working)")
+
+    # Bob decrypts both
+    r1 = bob.decrypt(ct_1, slot_timestamp)
+    r2 = bob.decrypt(ct_2, slot_timestamp)
+    assert r1 == msg_1
+    assert r2 == msg_2
+    ok(f"Message 1: {r1.decode()}")
+    ok(f"Message 2: {r2.decode()}")
+
     # =========================================================================
     # PHASE 5: BABEL INDEX — POLYMORPHIC ENCODING
     # =========================================================================

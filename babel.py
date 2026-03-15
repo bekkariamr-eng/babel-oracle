@@ -34,6 +34,8 @@ class BabelConfig:
     search_space: int = 0        # how many params to try
 
     def __post_init__(self):
+        if self.block_size not in (2, 3):
+            raise ValueError(f"block_size must be 2 or 3, got {self.block_size}")
         self.max_param = 1 << (self.block_size * 8)
         # oversample by 8x to ensure near-100% coverage
         self.search_space = self.max_param * 8
@@ -73,7 +75,7 @@ class BabelIndex:
         ).digest()
         return int.from_bytes(h[: self.B], "big")
 
-    def build(self, verbose: bool = True) -> None:
+    def build(self, verbose: bool = True, progress_callback=None) -> None:
         """
         Build the reverse index by evaluating the oracle function
         over the search space and storing the mapping value → [params].
@@ -101,6 +103,8 @@ class BabelIndex:
                 cov = len(self.index) / target_count * 100
                 print(f"  [{pct:5.1f}%] searched {p+1:>10,} | "
                       f"coverage: {cov:.1f}% ({len(self.index):,}/{target_count:,})")
+            if progress_callback and (p + 1) % milestone == 0:
+                progress_callback(p + 1, search_count)
 
         elapsed = time.time() - t0
         coverage = len(self.index) / target_count

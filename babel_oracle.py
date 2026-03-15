@@ -76,9 +76,21 @@ def sha256_ctr_generate(seed: bytes, length: int) -> bytes:
         ctr += 1
     return out[:length]
 
+def chacha20_generate(seed: bytes, length: int) -> bytes:
+    """ChaCha20 keystream generator (fast, hardware-accelerated)."""
+    from cryptography.hazmat.primitives.ciphers import Cipher
+    from cryptography.hazmat.primitives.ciphers.algorithms import ChaCha20
+    key = hkdf_expand(seed, b"chacha20-key", 32)
+    nonce = hkdf_expand(seed, b"chacha20-nonce", 16)
+    cipher = Cipher(ChaCha20(key, nonce), mode=None)
+    encryptor = cipher.encryptor()
+    return encryptor.update(b"\x00" * length)
+
+
 def generate_otp(seed: bytes, length: int, backend: str = "sha256-ctr") -> bytes:
-    """Generate OTP bytes using the configured backend.
-    ChaCha20 support will be added in a later step."""
+    """Generate OTP bytes using the configured backend."""
+    if backend == "chacha20":
+        return chacha20_generate(seed, length)
     return sha256_ctr_generate(seed, length)
 
 def xor_bytes(a: bytes, b: bytes) -> bytes:
@@ -277,6 +289,74 @@ def save_replay_log(log: dict):
     """Save replay log to disk."""
     ensure_keys_dir()
     REPLAY_LOG_PATH.write_text(json.dumps(log, indent=2))
+
+
+SESSION_TTL = 86400  # Default: 24 hours
+CONFIG_PATH = KEYS_DIR / "config.json"
+SESSIONS_PATH = KEYS_DIR / "sessions.json"
+
+
+def load_config() -> dict:
+    """Load config from disk. Returns defaults if not found."""
+    defaults = {"session_ttl": SESSION_TTL, "otp_backend": "sha256-ctr"}
+    if not CONFIG_PATH.exists():
+        return defaults
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+        for k, v in defaults.items():
+            cfg.setdefault(k, v)
+        return cfg
+    except (json.JSONDecodeError, IOError):
+        return defaults
+
+
+def save_config(cfg: dict):
+    """Save config to disk."""
+    ensure_keys_dir()
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def get_session_id(ttl: int = 86400) -> int:
+    """Derive session ID based on TTL."""
+    if ttl >= 86400:
+        return int(time.strftime("%Y%m%d"))
+    return int(time.time()) // ttl
+
+
+def load_sessions() -> dict:
+    """Load session creation timestamps."""
+    if not SESSIONS_PATH.exists():
+        return {}
+    try:
+        return json.loads(SESSIONS_PATH.read_text())
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def save_sessions(sessions: dict):
+    """Save session timestamps."""
+    ensure_keys_dir()
+    SESSIONS_PATH.write_text(json.dumps(sessions, indent=2))
+
+
+def check_session_expiry(my_name: str, peer_name: str, session_id: int, ttl: int) -> Tuple[bool, int]:
+    """Check if session is expired. Returns (expired, seconds_remaining)."""
+    sessions = load_sessions()
+    key = f"{min(my_name, peer_name)}_{max(my_name, peer_name)}_{session_id}"
+    now = int(time.time())
+
+    if key not in sessions:
+        sessions[key] = {"created_at": now, "session_id": session_id}
+        save_sessions(sessions)
+        return False, ttl
+
+    created = sessions[key]["created_at"]
+    elapsed = now - created
+    remaining = ttl - elapsed
+
+    if remaining <= 0:
+        return True, 0
+    return False, remaining
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -500,11 +580,30 @@ def cmd_encrypt_message():
         pause()
         return
 
-    session_id = int(time.strftime("%Y%m%d"))
+    cfg = load_config()
+    ttl = cfg["session_ttl"]
+    session_id = get_session_id(ttl)
     session_key = derive_session(my_priv, peer_pub, session_id)
-    slot_ts = get_slot_timestamp()
 
-    print(f"\n  Session ID: {session_id} (today's date)")
+    expired, remaining = check_session_expiry(my_name, peer_name, session_id, ttl)
+    if expired:
+        print(f"\n  SESSION EXPIRED! TTL: {ttl}s")
+        print(f"  A new session will start automatically.")
+        session_id = get_session_id(ttl)
+        session_key = derive_session(my_priv, peer_pub, session_id)
+        sessions = load_sessions()
+        key = f"{min(my_name, peer_name)}_{max(my_name, peer_name)}_{session_id}"
+        sessions[key] = {"created_at": int(time.time()), "session_id": session_id}
+        save_sessions(sessions)
+        print(f"  New session ID: {session_id}")
+    else:
+        hours_left = remaining / 3600
+        print(f"  Session TTL: {hours_left:.1f}h remaining")
+
+    slot_ts = get_slot_timestamp()
+    backend = cfg.get("otp_backend", "sha256-ctr")
+
+    print(f"\n  Session ID: {session_id}")
     print(f"  Time slot:  {slot_ts} ({time.strftime('%H:%M UTC', time.gmtime(slot_ts))})")
     print()
 
@@ -533,12 +632,13 @@ def cmd_encrypt_message():
         padded_size = ((padded_size + 4095) // 4096) * 4096
 
     t0 = time.perf_counter()
-    packet = encrypt_data(plaintext, session_key, slot_ts)
+    packet = encrypt_data(plaintext, session_key, slot_ts, backend=backend)
     elapsed = time.perf_counter() - t0
 
     encoded = base64.b64encode(packet).decode()
 
     print(f"\n  Encrypted in {elapsed*1e6:.0f} us")
+    print(f"  OTP backend: {backend}")
     print(f"  Plaintext:   {len(plaintext)} bytes")
     print(f"  Padded to:   {padded_size} bytes")
     print(f"  Ciphertext:  {len(packet)} bytes")
@@ -595,7 +695,9 @@ def cmd_decrypt_message():
         pause()
         return
 
-    session_id = int(time.strftime("%Y%m%d"))
+    cfg = load_config()
+    ttl = cfg["session_ttl"]
+    session_id = get_session_id(ttl)
     session_key = derive_session(my_priv, peer_pub, session_id)
 
     print()
@@ -802,6 +904,38 @@ def cmd_demo():
     pause()
 
 
+def cmd_configure():
+    header("CONFIGURATION")
+    cfg = load_config()
+    print(f"  Current settings:")
+    print(f"    Session TTL: {cfg['session_ttl']}s ({cfg['session_ttl']/3600:.1f} hours)")
+    print(f"    OTP backend: {cfg['otp_backend']}")
+    print()
+
+    choice = input("  [1] Change session TTL  [2] Change OTP backend  [3] Back\n  > ").strip()
+    if choice == "1":
+        try:
+            ttl = int(input("  New TTL in seconds (e.g., 3600 for 1h, 86400 for 24h): "))
+            if ttl < 60:
+                print("  TTL must be at least 60 seconds.")
+                return
+            cfg["session_ttl"] = ttl
+            save_config(cfg)
+            print(f"  TTL updated to {ttl}s ({ttl/3600:.1f} hours)")
+        except ValueError:
+            print("  Invalid number.")
+    elif choice == "2":
+        print("  [1] sha256-ctr (default)  [2] chacha20")
+        bc = input("  > ").strip()
+        if bc == "2":
+            cfg["otp_backend"] = "chacha20"
+        else:
+            cfg["otp_backend"] = "sha256-ctr"
+        save_config(cfg)
+        print(f"  OTP backend set to: {cfg['otp_backend']}")
+    pause()
+
+
 def main():
     clear()
     print(BANNER)
@@ -816,6 +950,7 @@ def main():
             "Run full demo (Alice ↔ Bob)",
             "Statistical quality tests (NIST)",
             "Protocol information",
+            "Configure settings",
             "Exit",
         ])
 
@@ -834,6 +969,8 @@ def main():
         elif choice == 7:
             cmd_show_info()
         elif choice == 8:
+            cmd_configure()
+        elif choice == 9:
             print("\n  Goodbye.\n")
             sys.exit(0)
 

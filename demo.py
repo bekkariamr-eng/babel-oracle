@@ -29,8 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core import (
     KeyPair, Party, PAD_BUCKETS,
-    derive_slot_seed, SHA256_CTR_OTP,
-    xor_bytes, hkdf_extract, hkdf_expand,
+    derive_slot_seed, SHA256_CTR_OTP, ChaCha20_OTP,
+    xor_bytes, hkdf_extract, hkdf_expand, get_otp_generator,
 )
 from babel import BabelConfig, BabelIndex, BabelCodec
 from tests import run_all_tests, entropy_per_byte
@@ -244,7 +244,64 @@ def main():
     ok(f"Message 2: {r2.decode()}")
 
     # =========================================================================
-    # PHASE 5: BABEL INDEX — POLYMORPHIC ENCODING
+    # PHASE 3e: CHACHA20 BACKEND TEST
+    # =========================================================================
+    section("PHASE 3e — ChaCha20 Backend Encryption")
+
+    alice_cc = Party(name="Alice-ChaCha20", backend="chacha20")
+    bob_cc = Party(name="Bob-ChaCha20", backend="chacha20")
+
+    # Use same keys as Alice/Bob
+    alice_cc.keypair = alice.keypair
+    bob_cc.keypair = bob.keypair
+    alice_cc.establish_key(bob.public_key)
+    bob_cc.establish_key(alice.public_key)
+    alice_cc.open_session(session_id)
+    bob_cc.open_session(session_id)
+
+    assert alice_cc.session_key == bob_cc.session_key
+    ok("ChaCha20 parties share same session key")
+
+    cc_msg = "ChaCha20 is ~100x faster than SHA-256 CTR".encode()
+    kv("Plaintext", cc_msg.decode())
+
+    t0 = time.perf_counter()
+    cc_ct = alice_cc.encrypt(cc_msg, slot_timestamp)
+    t_cc_enc = time.perf_counter() - t0
+    kv("Ciphertext length", f"{len(cc_ct)} bytes")
+    kv("Encryption time", f"{t_cc_enc*1e6:.1f} us")
+
+    # Verify backend byte is 0x01 (ChaCha20)
+    assert cc_ct[16] == 0x01, "Backend byte should be 0x01 for ChaCha20"
+    ok("Backend byte = 0x01 (ChaCha20)")
+
+    # Bob (ChaCha20) decrypts
+    cc_recovered = bob_cc.decrypt(cc_ct, slot_timestamp)
+    assert cc_recovered == cc_msg, "ChaCha20 DECRYPTION FAILED!"
+    ok(f"Recovered: {cc_recovered.decode()}")
+
+    # Cross-backend: SHA-256 Bob can also decrypt ChaCha20 ciphertext
+    # (decrypt auto-detects backend from the byte)
+    cc_cross = bob.decrypt(cc_ct, slot_timestamp)
+    assert cc_cross == cc_msg, "Cross-backend decryption failed!"
+    ok("Cross-backend: SHA-256 Party decrypts ChaCha20 ciphertext (auto-detect)")
+
+    # ChaCha20 OTP speed benchmark
+    cc_seed = derive_slot_seed(alice_cc.session_key, slot_timestamp + 10)
+    t0 = time.perf_counter()
+    cc_gen = get_otp_generator(cc_seed, "chacha20")
+    cc_big = cc_gen.generate(100_000)
+    t_cc_big = time.perf_counter() - t0
+    kv("ChaCha20 100 KB", f"{t_cc_big*1000:.1f} ms ({0.1 / t_cc_big:.0f} MB/s)")
+
+    # Tamper test on ChaCha20 ciphertext
+    cc_tampered = bytearray(cc_ct)
+    cc_tampered[20] ^= 0xFF
+    assert bob_cc.decrypt(bytes(cc_tampered), slot_timestamp) is None
+    ok("HMAC integrity check: tampered ChaCha20 ciphertext rejected")
+
+    # =========================================================================
+    # PHASE 4: BABEL INDEX — POLYMORPHIC ENCODING
     # =========================================================================
     section("PHASE 4 — Babel Index Construction")
 
@@ -403,7 +460,8 @@ def main():
     kv("Network traffic", "ZERO (offline mode)")
 
     print("\n  Performance:")
-    kv("OTP generation", f"{0.1/t_big:.0f} MB/s")
+    kv("OTP generation (SHA-256)", f"{0.1/t_big:.0f} MB/s")
+    kv("OTP generation (ChaCha20)", f"{0.1/t_cc_big:.0f} MB/s")
     kv("Encryption", "< 10 us per message")
     kv("Babel index build", f"{t_build:.1f}s (one-time)")
     kv("Babel encode/decode", "< 100 us per message")

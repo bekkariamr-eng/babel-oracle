@@ -57,7 +57,7 @@ babel.py
   └── (no internal imports — uses only stdlib: hashlib, struct, time, random)
 
 core.py
-  └── cryptography.hazmat  (X25519PrivateKey, X25519PublicKey, serialization)
+  └── cryptography.hazmat  (X25519PrivateKey, X25519PublicKey, serialization, ChaCha20, Cipher)
 ```
 
 **Critical**: `babel_oracle.py` is a COMPLETE COPY of all logic — it duplicates `core.py` functions inline so it can be packaged as a single-file executable. If you modify crypto logic, you MUST update BOTH `core.py` AND the corresponding section in `babel_oracle.py`.
@@ -119,8 +119,11 @@ shared_secret (32 bytes, from ECDH)
 
 **Perfect Forward Secrecy**: Compromising `slot_seed_T` reveals nothing about `slot_seed_{T-1}` because HMAC-SHA256 is a PRF — you cannot reverse it to get the session_key.
 
-### Phase 2: OTP Generation (SHA-256 Counter Mode)
+### Phase 2: OTP Generation (SHA-256 Counter Mode / ChaCha20)
 
+Two backends are available, selectable per-party via `Party(backend="sha256-ctr")` or `Party(backend="chacha20")`:
+
+**Backend 1: SHA-256 CTR (default)**
 ```
 slot_seed (32 bytes)
     │
@@ -129,21 +132,31 @@ slot_seed (32 bytes)
     ├── SHA-256(slot_seed || 0x0000000000000002) → block_2 (32 bytes)
     │   ...
     └── SHA-256(slot_seed || counter_N)          → block_N (32 bytes)
-    
+
     OTP = block_0 || block_1 || ... || block_N (truncated to message length)
 ```
 
-**Implementation**: `core.py` → `SHA256_CTR_OTP` class
+**Backend 2: ChaCha20 (~100× faster)**
+```
+slot_seed (32 bytes)
+    │
+    ├── key   = HKDF-Expand(slot_seed, info="chacha20-key",   len=32)
+    ├── nonce = HKDF-Expand(slot_seed, info="chacha20-nonce", len=16)
+    │
+    └── OTP = ChaCha20(key, nonce).encrypt(zeros(length))
+```
 
-**Why SHA-256 CTR and not ChaCha20 directly?**
-- SHA-256 is available in Python's `hashlib` without external dependencies
-- For the PoC, this simplifies packaging (no need for `cryptography` lib for the OTP part)
-- Security is equivalent: SHA-256 in CTR mode is a standard CSPRNG construction
-- In production, ChaCha20 would be faster (SIMD-accelerated)
+**Implementation**: `core.py` → `SHA256_CTR_OTP`, `ChaCha20_OTP`, `get_otp_generator(seed, backend)` factory
 
-**Counter format**: 8-byte big-endian unsigned integer, appended to the seed. This gives 2^64 blocks × 32 bytes = 590 exabytes before counter wraps — effectively infinite.
+**ChaCha20 key/nonce derivation**: Uses HKDF-Expand with distinct info strings (`b"chacha20-key"` and `b"chacha20-nonce"`) to derive separate key and nonce from the seed. This is cryptographically sound — distinct info strings guarantee independent outputs.
 
-**Determinism guarantee**: Both parties use the same `slot_seed` (derived from the same `session_key` and `timestamp`), so they produce bit-identical OTP streams. This is the core property that eliminates the need for communication.
+**ChaCha20 statefulness**: The `ChaCha20_OTP` class creates the encryptor once in `__init__` and reuses it across `generate()` calls. This maintains correct counter state — creating a new encryptor each call would reset the counter and return identical bytes.
+
+**Counter format** (SHA-256 CTR): 8-byte big-endian unsigned integer, appended to the seed. This gives 2^64 blocks × 32 bytes = 590 exabytes before counter wraps — effectively infinite.
+
+**Determinism guarantee**: Both parties use the same `slot_seed` (derived from the same `session_key` and `timestamp`), so they produce bit-identical OTP streams regardless of backend. This is the core property that eliminates the need for communication.
+
+**Cross-backend compatibility**: The backend byte in the wire format (see Phase 3) allows a receiver to auto-detect which backend was used, so a SHA-256 CTR party can decrypt ChaCha20 ciphertext and vice versa.
 
 ### Phase 3: Encryption
 
@@ -159,14 +172,20 @@ plaintext (N bytes)
     │       LENGTH stores N (original size), NOT P (padded size)
     │       = framed (P + 43 bytes)
     │
-    ├── OTP = SHA256_CTR(slot_seed, len=P+43)
+    ├── nonce = os.urandom(16)    ← per-message random nonce
+    ├── effective_seed = HMAC-SHA256(slot_seed, nonce)
+    ├── OTP = backend(effective_seed, len=P+43)
     │
     └── ciphertext = framed XOR OTP
 
-    packet = slot_timestamp(8) || ciphertext(P+43)
+    packet = nonce(16) || backend_byte(1) || ciphertext(P+43)
 ```
 
-**Implementation**: `core.py` → `Party.encrypt(pad=True)`, `encrypt_data(pad=True)` (in babel_oracle.py)
+**Implementation**: `core.py` → `Party.encrypt(pad=True)`, `encrypt_data(pad=True, backend="sha256-ctr")` (in babel_oracle.py)
+
+**Per-message nonce**: Each encryption generates a fresh 16-byte random nonce. The nonce is mixed with the slot seed via `HMAC-SHA256(slot_seed, nonce)` to derive a unique `effective_seed` per message. This prevents OTP reuse when multiple messages are sent in the same 60-second time slot. The nonce is prepended to the packet in cleartext — it does not need to be secret, only unique.
+
+**Backend byte**: A single byte (0x00 = SHA-256 CTR, 0x01 = ChaCha20) is included in the wire format so the receiver can auto-detect which OTP backend was used. This enables cross-backend compatibility.
 
 **Message padding**: Plaintext is padded to fixed bucket sizes before framing. This prevents length-based traffic analysis — the adversary sees only the bucket size. Padding uses `os.urandom` (random bytes, not zeros). The LENGTH field stores the original unpadded size, so `unframe_message` extracts only the original bytes. Padding can be disabled with `pad=False` for backward compatibility.
 
@@ -174,41 +193,37 @@ plaintext (N bytes)
 
 **HMAC coverage**: The MAC is computed over `MAGIC || LENGTH || padded_plaintext`, NOT over the ciphertext. This is encrypt-then-MAC at the frame level — the MAC is encrypted along with the plaintext, providing both integrity and authentication.
 
-**Important**: The slot timestamp (8 bytes) is prepended IN CLEARTEXT to the packet. This is intentional — it tells the receiver which time slot to use. It does NOT leak information about the message because:
-1. The timestamp is the current time slot (public information)
-2. It reveals nothing about message content (ciphertext size reveals only the padding bucket, not exact length)
-
 ### Phase 4: Decryption
 
 ```
-packet
+packet (new format: nonce + backend + ciphertext)
     │
-    ├── Extract slot_timestamp = packet[0:8]
+    ├── Extract nonce = packet[0:16]
+    ├── Extract backend_byte = packet[16]     (0x00=sha256-ctr, 0x01=chacha20)
+    ├── ciphertext = packet[17:]
     │
-    ├── REPLAY CHECK: is (peer, slot_timestamp) already seen?
+    ├── REPLAY CHECK: is "slot_ts:nonce_hex" already seen?
     │       → YES: return None (replay rejected)
     │
-    ├── ciphertext = packet[8:]
-    │
     ├── slot_seed = derive_slot_seed(session_key, slot_timestamp)
-    ├── OTP = SHA256_CTR(slot_seed, len=len(ciphertext))
+    ├── effective_seed = HMAC-SHA256(slot_seed, nonce)
+    ├── OTP = backend(effective_seed, len=len(ciphertext))
     │
     ├── framed = ciphertext XOR OTP
     │
-    ├── Verify: framed[0:7] == MAGIC?
-    ├── Extract length = framed[7:11]       (original unpadded length)
-    ├── Extract plaintext = framed[11:11+length]  (strips padding automatically)
-    ├── Extract mac_received = framed[-32:]
+    ├── unframe_message(framed, session_key):
+    │       Verify MAGIC, extract LENGTH, extract plaintext, verify HMAC
     │
-    ├── mac_computed = HMAC-SHA256(session_key, MAGIC || LENGTH || padded_plaintext)
-    └── VERIFY: mac_received == mac_computed? (constant-time comparison)
-            → YES: record (peer, slot_timestamp) as seen; return plaintext
-            → NO:  return None (tampered or wrong key)
+    └── VERIFY: HMAC valid?
+            → YES: record "slot_ts:nonce_hex" as seen; return plaintext
+            → NO:  try legacy format fallback, then return None
 ```
 
 **Implementation**: `core.py` → `Party.decrypt(seen_slots=set())`, `decrypt_data(peer_name, replay_log)` (in babel_oracle.py)
 
-**Replay protection**: In `core.py`, `Party.decrypt()` accepts an optional `seen_slots: set` — slot timestamps are checked before decryption and recorded after success. In `babel_oracle.py`, `decrypt_data()` accepts `peer_name` and `replay_log` (dict) — replay state is persisted to `~/.babel-oracle/replay_log.json` with 24-hour auto-pruning via `load_replay_log()` / `save_replay_log()`.
+**Dual-path decryption**: The decrypt function first tries the new format (nonce + backend byte + ciphertext). If `unframe_message()` returns None (MAGIC or HMAC mismatch), it falls back to legacy format (no nonce, no backend byte, raw SHA-256 CTR). This ensures backward compatibility with messages encrypted before the nonce update.
+
+**Replay protection**: In `core.py`, `Party.decrypt()` accepts an optional `seen_slots: set`. For new-format messages, the replay key is `"slot_ts:nonce_hex"` (a string), allowing multiple messages per slot (each with a unique nonce). For legacy messages, the replay key is `int(slot_ts)`. In `babel_oracle.py`, `decrypt_data()` persists seen entries to `~/.babel-oracle/replay_log.json` with 24-hour auto-pruning via `load_replay_log()` / `save_replay_log()`. The replay log handles both legacy int entries and new string entries.
 
 ---
 
@@ -302,18 +317,20 @@ DECODE (Bob):
 
 | Priority | Item | Status | Description |
 |----------|------|--------|-------------|
-| HIGH | **Replay protection** | DONE | Tracks seen (peer, slot_ts) tuples. `core.py`: `Party.decrypt(seen_slots=set())`. `babel_oracle.py`: persists to `~/.babel-oracle/replay_log.json` with 24-hour auto-pruning via `load_replay_log()` / `save_replay_log()`. |
+| HIGH | **Replay protection** | DONE | Tracks seen `"slot_ts:nonce_hex"` tuples (new format) or `int(slot_ts)` (legacy). `core.py`: `Party.decrypt(seen_slots=set())`. `babel_oracle.py`: persists to `~/.babel-oracle/replay_log.json` with 24-hour auto-pruning via `load_replay_log()` / `save_replay_log()`. |
 | HIGH | **Key file encryption** | DONE | PBKDF2HMAC (SHA-256, 600K iterations) + AES-256-GCM. `encrypt_private_key()` / `decrypt_private_key()` in `babel_oracle.py`. Encrypted identity files use `{"version": 2, "encrypted": true, "private_enc": {salt, nonce, ciphertext}}`. Old plaintext files auto-detected and loaded without passphrase. |
 | HIGH | **Message padding** | DONE | `pad_plaintext()` pads to bucket sizes `[256, 512, 1024, 2048, 4096]` with `os.urandom` fill. Messages >4096 pad to next 4096 multiple. `frame_message(pad=True)` enabled by default. LENGTH field stores original size so `unframe_message` strips padding automatically. |
+| MEDIUM | **Per-message nonce** | DONE | Each `encrypt()` generates a 16-byte random nonce, mixed with slot seed via `HMAC-SHA256(slot_seed, nonce)` to derive a unique effective seed. Eliminates OTP reuse when multiple messages are sent in the same 60-second slot. Wire format: `nonce(16) \|\| backend_byte(1) \|\| ciphertext`. Backward-compatible: decrypt falls back to legacy (no-nonce) format. |
+| MEDIUM | **Session expiry** | DONE | Configurable TTL via `~/.babel-oracle/config.json` (default: 86400s = 24h). `get_session_id(ttl)` derives session ID from `time() // ttl`. `check_session_expiry()` warns when session is about to rotate. Settings menu (option 8) allows changing TTL and OTP backend. `load_sessions()` / `save_sessions()` persist session state. |
+| LOW | **ChaCha20 backend** | DONE | `ChaCha20_OTP` class in `core.py` uses `cryptography.hazmat.primitives.ciphers.algorithms.ChaCha20`. Key and nonce derived via HKDF-Expand with distinct info strings (`b"chacha20-key"`, `b"chacha20-nonce"`). ~100× faster than SHA-256 CTR (~450 MB/s vs ~3 MB/s). Stateful encryptor maintained across `generate()` calls. Backend selectable via `Party(backend="chacha20")` or settings menu. Cross-backend decrypt auto-detects from wire format byte. |
+| LOW | **Babel B=3 support** | DONE | `BabelConfig` now accepts `block_size=3` (16M targets, ~30s build, ~400MB memory). `BabelIndex.build()` accepts optional `progress_callback` for GUI/CLI progress reporting. |
 
 ### Remaining TODOs
 
 | Priority | Item | Description |
 |----------|------|-------------|
-| MEDIUM | **Session expiry** | Sessions currently last forever. Add configurable TTL and re-keying mechanism. |
-| MEDIUM | **Multi-message per slot** | Currently one OTP stream per slot. If Alice sends two messages in the same 60-second slot, they use the same OTP base (different offsets due to framing). Consider adding a per-message nonce. |
-| LOW | **Babel B=3/B=4** | Current demo uses B=2. B=3 requires ~16M entries (~30s build). B=4 requires rainbow chain compression (~500MB, separate implementation). |
-| LOW | **ChaCha20 backend** | Replace SHA-256 CTR with ChaCha20 for 10× speed improvement. Requires `cryptography` lib. |
+| LOW | **Babel B=4** | B=4 requires rainbow chain compression (~500MB on disk, separate implementation). |
+| LOW | **Lorenz-SHA backend** | Chaotic system OTP generator — requires fixed-point 128-bit arithmetic for cross-platform determinism. See Extension Points. |
 
 ### Architecture Decisions That Should NOT Change
 
@@ -329,7 +346,7 @@ DECODE (Bob):
 
 ### Adding a New OTP Backend
 
-To add a new keystream generator (e.g., ChaCha20, Lorenz-SHA):
+Two backends are already implemented: `SHA256_CTR_OTP` (default) and `ChaCha20_OTP`. To add another (e.g., Lorenz-SHA):
 
 1. Create a class with the same interface as `SHA256_CTR_OTP`:
    ```python
@@ -341,15 +358,19 @@ To add a new keystream generator (e.g., ChaCha20, Lorenz-SHA):
 
 2. The class MUST be deterministic: same seed → same output, always.
 
-3. Plug it into `Party.get_otp()` in `core.py`:
+3. Register it in `get_otp_generator()` factory in `core.py`:
    ```python
-   def get_otp(self, slot_timestamp, length):
-       seed = derive_slot_seed(self.session_key, slot_timestamp)
-       gen = NewOTP(seed)  # swap here
-       return gen.generate(length)
+   def get_otp_generator(seed: bytes, backend: str = "sha256-ctr"):
+       if backend == "chacha20":
+           return ChaCha20_OTP(seed)
+       if backend == "new-backend":
+           return NewOTP(seed)
+       return SHA256_CTR_OTP(seed)
    ```
 
-4. Update `babel_oracle.py` accordingly (it has its own inline copy).
+4. Add a new backend byte value (e.g., `0x02`) in `Party.encrypt()` and `Party.decrypt()`.
+
+5. Update `babel_oracle.py` accordingly (it has its own inline copy).
 
 ### Adding API Mode (Astronomical Oracle)
 
@@ -419,14 +440,20 @@ class LorenzSHA:
 | Master key info | `b"babel-oracle-master-key"` | core.py | HKDF-Expand info string |
 | Session key prefix | `b"babel-session-"` | core.py | Prepended to session_id for derivation |
 | Session key info | `b"session-key"` | core.py | HKDF-Expand info string |
+| ChaCha20 key info | `b"chacha20-key"` | core.py | HKDF-Expand info for ChaCha20 key derivation |
+| ChaCha20 nonce info | `b"chacha20-nonce"` | core.py | HKDF-Expand info for ChaCha20 nonce derivation |
+| Backend byte (SHA-256) | `0x00` | core.py, babel_oracle.py | Wire format backend identifier |
+| Backend byte (ChaCha20) | `0x01` | core.py, babel_oracle.py | Wire format backend identifier |
 | Babel domain prefix | `b"babel-index-domain-"` | babel.py | Domain separator for Babel Index |
-| Slot duration | 60 seconds | babel_oracle.py | Time quantization for slot_seed |
-| Session ID | `YYYYMMDD` as int | babel_oracle.py | Daily session rotation |
+| Slot duration | 60 seconds (configurable) | babel_oracle.py | Time quantization for slot_seed |
+| Session TTL | 86400s default (configurable) | babel_oracle.py | Session rotation interval |
 | Counter format | 8-byte big-endian uint64 | core.py | SHA-256 CTR counter |
 | `PAD_BUCKETS` | `[256, 512, 1024, 2048, 4096]` | core.py, babel_oracle.py | Message padding bucket sizes |
 | PBKDF2 iterations | 600,000 | babel_oracle.py | Key file encryption key derivation |
 | `REPLAY_MAX_AGE` | 86400 (24 hours) | babel_oracle.py | Replay log auto-pruning threshold |
 | Replay log path | `~/.babel-oracle/replay_log.json` | babel_oracle.py | Persistent replay protection state |
+| Config path | `~/.babel-oracle/config.json` | babel_oracle.py | User settings (TTL, backend) |
+| Sessions path | `~/.babel-oracle/sessions.json` | babel_oracle.py | Active session state |
 
 **Changing any of these breaks compatibility** between existing encrypted messages and new versions. If you change them, bump the MAGIC version (e.g., `BABEL02`).
 
@@ -468,18 +495,30 @@ class LorenzSHA:
 }
 ```
 
-### Encrypted Packet (binary)
+### Encrypted Packet — New Format (binary)
 ```
-[0:8]     slot_timestamp    uint64 big-endian
-[8:15]    encrypted MAGIC   7 bytes (XOR'd with OTP)
-[15:19]   encrypted LENGTH  4 bytes (XOR'd with OTP) — stores ORIGINAL unpadded size
-[19:19+P] encrypted PAYLOAD P bytes (XOR'd with OTP) — padded to bucket size
-[19+P:]   encrypted HMAC    32 bytes (XOR'd with OTP)
+[0:16]    nonce             16 bytes random per-message nonce (cleartext)
+[16]      backend_byte      1 byte (0x00=SHA-256 CTR, 0x01=ChaCha20)
+[17:24]   encrypted MAGIC   7 bytes (XOR'd with OTP)
+[24:28]   encrypted LENGTH  4 bytes (XOR'd with OTP) — stores ORIGINAL unpadded size
+[28:28+P] encrypted PAYLOAD P bytes (XOR'd with OTP) — padded to bucket size
+[28+P:]   encrypted HMAC    32 bytes (XOR'd with OTP)
 ```
 
 P = padded size (one of 256, 512, 1024, 2048, 4096, or next 4096 multiple).
 LENGTH stores the original message size so `unframe_message` extracts exactly the original bytes.
-Total overhead: 8 (timestamp) + 7 (magic) + 4 (length) + padding + 32 (HMAC).
+Total overhead: 16 (nonce) + 1 (backend) + 7 (magic) + 4 (length) + padding + 32 (HMAC).
+
+### Encrypted Packet — Legacy Format (backward compat)
+```
+[0:8]     slot_timestamp    uint64 big-endian
+[8:15]    encrypted MAGIC   7 bytes (XOR'd with OTP)
+[15:19]   encrypted LENGTH  4 bytes
+[19:19+P] encrypted PAYLOAD P bytes
+[19+P:]   encrypted HMAC    32 bytes
+```
+
+The decrypt function auto-detects format: tries new format first (nonce+backend), falls back to legacy if HMAC verification fails.
 
 ### Babel-Encoded Packet (binary)
 ```
@@ -510,6 +549,12 @@ When modifying the code, verify ALL of the following:
 □ Padding: ciphertext size matches expected bucket (e.g., 56B msg → 256B padded frame)
 □ Padding roundtrip: decrypt(encrypt(msg, pad=True)) == msg (original bytes, no padding)
 □ Replay: first decrypt succeeds, second decrypt of same packet returns None
+□ Multi-message same slot: two encrypts in same slot produce different ciphertext (nonce)
+□ Multi-message same slot: both messages decrypt correctly
+□ ChaCha20 roundtrip: bob.decrypt(alice_chacha.encrypt(msg, T), T) == msg
+□ ChaCha20 backend byte: ciphertext[16] == 0x01 for ChaCha20
+□ Cross-backend: SHA-256 party decrypts ChaCha20 ciphertext (auto-detect)
+□ ChaCha20 tamper: tampered ChaCha20 ciphertext rejected
 □ Key encryption: save_identity(passphrase) → file has "encrypted": true, no plaintext key
 □ Key decryption: load_identity with correct passphrase returns valid key
 □ Key decryption: load_identity with wrong passphrase raises ValueError
@@ -534,15 +579,17 @@ python3 demo.py   # Full E2E with assertions and NIST tests
 |-----------|------|------------|-------|
 | ECDH key exchange | ~0.5 ms | one-time | Curve25519 |
 | HKDF derivation | ~0.01 ms | per-session | SHA-256 based |
-| SHA-256 CTR OTP (1 KB) | ~40 µs | ~25 MB/s | Python, no C extensions |
-| SHA-256 CTR OTP (100 KB) | ~7 ms | ~14 MB/s | Python, no C extensions |
+| SHA-256 CTR OTP (1 KB) | ~40 µs | ~25 MB/s | Python hashlib C extension |
+| SHA-256 CTR OTP (100 KB) | ~32 ms | ~3 MB/s | Python hashlib C extension |
+| ChaCha20 OTP (100 KB) | ~0.2 ms | ~450 MB/s | OpenSSL-accelerated via `cryptography` |
 | XOR encryption | ~10 µs | per-message | Trivial |
 | HMAC-SHA256 | ~5 µs | per-message | Integrity tag |
-| Babel Index build (B=2) | ~1.7 s | one-time | 524K evaluations |
+| Babel Index build (B=2) | ~6 s | one-time | 524K evaluations + gap-fill |
+| Babel Index build (B=3) | ~30 s | one-time | ~134M evaluations |
 | Babel encode | ~120 µs | per-message | Index lookup |
 | Babel decode | ~40 µs | per-message | Hash evaluation |
 
-**Bottleneck**: SHA-256 in pure Python is slow (~14 MB/s). With `hashlib` C extension (which is already used), this is the speed. To go faster: use ChaCha20 from `cryptography` library (hardware-accelerated, 1+ GB/s) or use `hmac` with `_hashlib` (OpenSSL backend).
+**ChaCha20 advantage**: The ChaCha20 backend is ~100× faster than SHA-256 CTR because it uses OpenSSL's SIMD-accelerated implementation via the `cryptography` library. For bulk encryption or large files, ChaCha20 is strongly recommended.
 
 ---
 
@@ -589,12 +636,13 @@ be a separate Zeek/Suricata/XGBoost pipeline analyzing network captures.
 | Task | Where to Look |
 |------|---------------|
 | Change time slot duration | `babel_oracle.py` → `get_slot_timestamp()`, change `// 60 * 60` |
+| Change session TTL | `babel_oracle.py` → settings menu (option 8), or edit `~/.babel-oracle/config.json` |
+| Switch OTP backend | `babel_oracle.py` → settings menu (option 8), or `Party(backend="chacha20")` in `core.py` |
 | Change padding buckets | `core.py` + `babel_oracle.py` → modify `PAD_BUCKETS` list |
 | Disable padding | Pass `pad=False` to `frame_message()`, `Party.encrypt()`, or `encrypt_data()` |
 | Change replay log TTL | `babel_oracle.py` → modify `REPLAY_MAX_AGE` (default 86400 = 24h) |
 | Change PBKDF2 iterations | `babel_oracle.py` → modify `iterations=600_000` in `encrypt_private_key()` / `decrypt_private_key()` |
-| Switch to ChaCha20 | `core.py` → replace `SHA256_CTR_OTP` with ChaCha20 from `cryptography.hazmat` |
-| Add Lorenz backend | Create `lorenz.py`, implement fixed-point RK4 + SHA-256 whitening |
+| Add Lorenz backend | Create `lorenz.py`, implement fixed-point RK4 + SHA-256 whitening, register in `get_otp_generator()` |
 | Add API oracle mode | Create `api_oracle.py`, combine with local OTP via XOR |
 | Change Babel block size | `demo.py` → `BabelConfig(block_size=3)`, increase search_space proportionally |
 | Add GUI | Use `tkinter` or `PyQt5`, import functions from `babel_oracle.py` |

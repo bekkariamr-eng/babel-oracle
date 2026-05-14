@@ -90,7 +90,8 @@ class QRKeyExchange:
         if not HAS_PIL:
             raise ImportError("Pillow package required: pip install Pillow")
 
-        assert len(public_key) == 32, "Public key must be 32 bytes"
+        if len(public_key) != 32:
+            raise ValueError(f"Public key must be 32 bytes, got {len(public_key)}")
 
         payload = json.dumps({
             "babel": QRKeyExchange.PROTOCOL_VERSION,
@@ -219,7 +220,8 @@ class LSBSteganography:
 
     def __init__(self, config: Optional[StegoConfig] = None):
         self.config = config or StegoConfig()
-        assert self.config.bits_per_channel in (1, 2), "bits_per_channel must be 1 or 2"
+        if self.config.bits_per_channel not in (1, 2):
+            raise ValueError(f"bits_per_channel must be 1 or 2, got {self.config.bits_per_channel}")
 
     def _derive_stego_key(self, session_key: bytes) -> bytes:
         """Derive the stego scatter key from session key."""
@@ -255,10 +257,9 @@ class LSBSteganography:
 
         return indices[:n]
 
-    def _crc32(self, data: bytes) -> bytes:
-        """Compute CRC32 checksum as 4 bytes."""
-        import zlib
-        return struct.pack(">I", zlib.crc32(data) & 0xFFFFFFFF)
+    def _integrity_tag(self, data: bytes, stego_key: bytes) -> bytes:
+        """Compute HMAC-SHA256 integrity tag, truncated to 4 bytes."""
+        return hmac.new(stego_key, data, hashlib.sha256).digest()[:4]
 
     def capacity(self, image: "Image.Image") -> int:
         """
@@ -308,12 +309,13 @@ class LSBSteganography:
         num_pixels = w * h
         pixels = list(img.getdata())
 
-        # Build payload: MAGIC || LENGTH || DATA || CRC32
+        # Build payload: MAGIC || LENGTH || DATA || HMAC_TAG
+        stego_key = self._derive_stego_key(session_key)
         payload = (
             self.config.magic
             + struct.pack(">I", len(data))
             + data
-            + self._crc32(data)
+            + self._integrity_tag(data, stego_key)
         )
 
         # Convert payload to bit stream
@@ -331,8 +333,7 @@ class LSBSteganography:
                 f"have {usable_pixels} usable ({num_pixels} total)"
             )
 
-        # Generate scatter pattern
-        stego_key = self._derive_stego_key(session_key)
+        # Generate scatter pattern (stego_key already derived above)
         scatter = self._generate_scatter(stego_key, num_pixels, pixels_needed)
 
         # Embed bits
@@ -477,10 +478,11 @@ class LSBSteganography:
             return None
 
         data = full_payload[8:8 + data_length]
-        crc_stored = full_payload[8 + data_length:8 + data_length + 4]
-        crc_computed = self._crc32(data)
+        tag_stored = full_payload[8 + data_length:8 + data_length + 4]
+        stego_key = self._derive_stego_key(session_key)
+        tag_computed = self._integrity_tag(data, stego_key)
 
-        if crc_stored != crc_computed:
+        if not hmac.compare_digest(tag_stored, tag_computed):
             return None
 
         return data
@@ -535,8 +537,8 @@ class StegoTransport(Transport):
     def _get_cover_image(self) -> "Image.Image":
         """Get a cover image — from provided list or generate synthetic."""
         if self.cover_images:
-            import random
-            path = random.choice(self.cover_images)
+            import secrets
+            path = secrets.choice(self.cover_images)
             return Image.open(path).convert("RGB")
         else:
             # Generate a synthetic cover image

@@ -428,7 +428,9 @@ class Node:
         # Unknown types: discard silently (multi-party tolerance)
 
     def _handle_key_announce(self, payload: bytes) -> None:
-        """Process a peer's public key announcement."""
+        """Process a peer's public key announcement.
+        WARNING: unauthenticated — transport channel must be trusted or
+        keys verified out-of-band to prevent MITM."""
         try:
             peer_name, peer_pk = _decode_key_announce(payload)
         except (IndexError, ValueError):

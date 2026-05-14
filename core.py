@@ -110,7 +110,8 @@ class SHA256_CTR_OTP:
     """
 
     def __init__(self, seed: bytes):
-        assert len(seed) == 32, "Seed must be 32 bytes"
+        if len(seed) != 32:
+            raise ValueError(f"Seed must be 32 bytes, got {len(seed)}")
         self.seed = seed
         self.counter = 0
         self.buffer = b""
@@ -141,7 +142,8 @@ class ChaCha20_OTP:
     """
 
     def __init__(self, seed: bytes):
-        assert len(seed) == 32, "Seed must be 32 bytes"
+        if len(seed) != 32:
+            raise ValueError(f"Seed must be 32 bytes, got {len(seed)}")
         from cryptography.hazmat.primitives.ciphers import Cipher
         from cryptography.hazmat.primitives.ciphers.algorithms import ChaCha20
         key = hkdf_expand(seed, b"chacha20-key", 32)
@@ -179,7 +181,8 @@ def get_otp_generator(seed: bytes, backend: str = "sha256-ctr"):
 
 def xor_bytes(data: bytes, key: bytes) -> bytes:
     """XOR data with key (Vernam cipher)."""
-    assert len(data) <= len(key), f"Key too short: {len(key)} < {len(data)}"
+    if len(data) > len(key):
+        raise ValueError(f"Key too short: {len(key)} < {len(data)}")
     return bytes(a ^ b for a, b in zip(data, key))
 
 

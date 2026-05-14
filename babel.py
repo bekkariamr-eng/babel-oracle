@@ -16,11 +16,11 @@ Author: Amr Bekkari
 """
 
 import hashlib
+import secrets
 import struct
 import os
 import json
 import time
-import random
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -152,12 +152,13 @@ class BabelIndex:
         Randomly selects among collisions (polymorphism).
         Returns None if no match found (should not happen with full coverage).
         """
-        assert len(block) == self.B
+        if len(block) != self.B:
+            raise ValueError(f"Block must be {self.B} bytes, got {len(block)}")
         val = int.from_bytes(block, "big")
         candidates = self.index.get(val)
         if not candidates:
             return None
-        return random.choice(candidates)
+        return secrets.choice(candidates)
 
     def lookup_all(self, block: bytes) -> List[int]:
         """Return ALL parameters that produce the target block."""
@@ -202,7 +203,8 @@ class BabelCodec:
         Encode data into a sequence of Babel parameters.
         Each parameter, when evaluated, produces B bytes of the original data.
         """
-        assert self.idx.built, "Build the index first"
+        if not self.idx.built:
+            raise RuntimeError("Build the index first")
 
         # Pad to block boundary
         padded = data

@@ -11,7 +11,7 @@ import math
 import hashlib
 import struct
 from typing import Dict, Tuple
-from core import SHA256_CTR_OTP
+from core import SHA256_CTR_OTP, ChaCha20_OTP
 
 
 def frequency_test(data: bytes) -> Tuple[float, bool]:
@@ -137,14 +137,8 @@ def _chi2_pvalue(chi_sq: float, df: int) -> float:
     return max(0.0, min(1.0, p))
 
 
-def run_all_tests(seed: bytes, num_bytes: int = 100_000) -> Dict:
-    """
-    Run all statistical tests on SHA-256 CTR output.
-    Returns a dict with test names, p-values, and pass/fail status.
-    """
-    gen = SHA256_CTR_OTP(seed)
-    data = gen.generate(num_bytes)
-
+def _run_suite(data: bytes) -> Dict:
+    """Run the statistical test suite on a byte sample."""
     results = {}
 
     p, passed = frequency_test(data)
@@ -169,3 +163,23 @@ def run_all_tests(seed: bytes, num_bytes: int = 100_000) -> Dict:
     results["byte_distribution_chi2"] = {"p_value": round(p, 6), "pass": passed}
 
     return results
+
+
+def run_all_tests(seed: bytes, num_bytes: int = 100_000) -> Dict:
+    """
+    Run all statistical tests on SHA-256 CTR output.
+    Returns a dict with test names, p-values, and pass/fail status.
+    """
+    gen = SHA256_CTR_OTP(seed)
+    data = gen.generate(num_bytes)
+    return _run_suite(data)
+
+
+def run_all_tests_chacha20(seed: bytes, num_bytes: int = 100_000) -> Dict:
+    """
+    Run all statistical tests on ChaCha20 output.
+    Returns a dict with test names, p-values, and pass/fail status.
+    """
+    gen = ChaCha20_OTP(seed)
+    data = gen.generate(num_bytes)
+    return _run_suite(data)

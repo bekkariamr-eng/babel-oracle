@@ -32,6 +32,7 @@ babel-oracle/
 ├── babel_oracle.py    # Standalone interactive CLI app (single-file, all-in-one)
 ├── core.py            # Crypto primitives: ECDH, HKDF, SHA-256 CTR, XOR, Party
 ├── babel.py           # Babel Index: reverse lookup table, polymorphic codec
+├── transport.py       # Automatic transport layer: shared folder, TCP socket, Node
 ├── tests.py           # NIST SP 800-22 statistical quality tests
 ├── demo.py            # Full E2E demo script (non-interactive, prints results)
 ├── build_windows.bat  # PyInstaller build script for Windows .exe
@@ -49,6 +50,9 @@ demo.py
   ├── core.py     (Party, KeyPair, SHA256_CTR_OTP, xor_bytes, derive_*)
   ├── babel.py    (BabelConfig, BabelIndex, BabelCodec)
   └── tests.py    (run_all_tests, entropy_per_byte)
+
+transport.py
+  └── core.py     (KeyPair, Party)
 
 tests.py
   └── core.py     (SHA256_CTR_OTP)
@@ -646,4 +650,77 @@ be a separate Zeek/Suricata/XGBoost pipeline analyzing network captures.
 | Add API oracle mode | Create `api_oracle.py`, combine with local OTP via XOR |
 | Change Babel block size | `demo.py` → `BabelConfig(block_size=3)`, increase search_space proportionally |
 | Add GUI | Use `tkinter` or `PyQt5`, import functions from `babel_oracle.py` |
-| Add network transport | Implement `StegoChannel` interface (see Extension Points above) |
+| Use shared folder transport | `transport.py` → `SharedFolderTransport(folder_path)` + `Node` |
+| Use TCP socket transport | `transport.py` → `SocketTransport(mode, host, port)` + `Node` |
+| Run transport demos | `python transport.py` → select shared folder, socket, or both |
+| Add new transport | Subclass `Transport` ABC in `transport.py` (implement send/poll/start/stop) |
+
+---
+
+## 16. Why This Project Exists — Comparison with Existing Tools
+
+### Core Distinction
+
+**Confidentiality** (Signal, TLS, PGP) = nobody can READ my message. The adversary KNOWS communication happens but can't access content.
+
+**Undetectability** (Babel Oracle) = nobody can KNOW a message exists. The adversary sees no communication at all.
+
+These are orthogonal problems. Signal solves the first. Babel Oracle solves the second.
+
+### Comparison Table
+
+| Criterion | Signal | Tor | I2P | VPN | Babel Oracle |
+|-----------|--------|-----|-----|-----|--------------|
+| Content encrypted | Yes | Yes | Yes | Yes | Yes |
+| Metadata hidden (who talks to who) | No | Partial | Partial | No | Yes |
+| Existence hidden (is there communication?) | No | No | No | No | Yes |
+| Zero infrastructure (no servers) | No (Signal servers) | No (relays) | No (routers) | No (VPN server) | Nothing |
+| Blockable by state? | Yes (IP block) | Partially (bridges) | Hard | Yes (DPI) | No |
+| Works offline | No | No | No | No | Yes |
+| Speed | 100+ Mbps | ~2 Mbps | ~500 Kbps | 100+ Mbps | ~1 Kbps stego |
+| Security audit | Extensive | Extensive | Moderate | Yes | None (research prototype) |
+| Usability | Excellent | Medium | Hard | Good | Prototype |
+
+### Where Babel Oracle Wins (4 Scenarios)
+
+1. **Journalist in authoritarian regime**: Signal/Tor/VPN all blocked. Babel has nothing to block — no servers, no protocol fingerprint.
+
+2. **Post-compromise C2**: Pentester on surveilled network. All C2 frameworks (Cobalt Strike, Havoc) generate detectable traffic. Babel offline + shared folder has zero network signature.
+
+3. **Air-gap communication**: Internet cut off (disaster, conflict). Babel offline + USB works with zero connectivity.
+
+4. **Deniability**: Signal leaves forensic traces (SQLite DB, certs). Babel with encrypted keys and deleted messages leaves only a generic Python script and an empty folder.
+
+### Where Babel Oracle Loses (Honest Constraints)
+
+1. **Bandwidth**: ~1 Kbps effective in stego mode. Not for files, only for short messages (signaling channel).
+
+2. **No audit**: Individual primitives are proven (SHA-256, ECDH, HMAC) but the composition is novel and unaudited.
+
+3. **Clock sync**: Both parties need ±30s sync. NTP solves it online, but air-gap drift is a real problem after days.
+
+4. **Bootstrap**: Initial key exchange needs some channel. Public keys aren't secret, but an adversary observing the exchange knows the parties know each other.
+
+5. **Steganographic channel**: The PoC uses a shared folder — that's file sharing, not steganography. A real covert channel needs LSB embedding, DNS timing, or similar — each with its own detection surface.
+
+### What to Say to Evaluators
+
+"Babel Oracle does not replace Signal. It solves a problem Signal doesn't solve: undetectability of the communication's existence itself. The project demonstrates feasibility of this channel class, then provides tools to detect it. The contribution is dual: offensive (protocol) and defensive (detector)."
+
+### Improvement Roadmap
+
+**Short term:**
+- Integrate `transport.py` into `babel_oracle.py` main menu
+- Add LSB PNG steganography channel (embed ciphertext in image pixels)
+- Add Lorenz-SHA backend (fixed-point chaotic system + SHA-256 whitening)
+
+**Medium term:**
+- Build the detection framework (XGBoost on 7 features: sigma(lat), sigma(lon), sigma(date), H(API), rate regularity, param entropy, cross-endpoint correlation)
+- Add DNS-based covert channel (`HMAC(K,slot).example.com` subdomains)
+- Add timing-based channel (encode bits in inter-request delays)
+
+**Long term:**
+- Port to Rust/Go for native compilation (no Python dependency)
+- Add Kyber/ML-KEM for post-quantum resistance (Curve25519 is vulnerable to Shor's algorithm)
+- GUI (tkinter or web-based)
+- Third-party security audit of the protocol composition

@@ -40,9 +40,10 @@ try:
     from cryptography.hazmat.primitives import serialization, hashes
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    HAS_ECDH = True
 except ImportError:
-    HAS_ECDH = False
+    print("\n  FATAL: 'cryptography' package is required.")
+    print("  Install it with: pip install cryptography")
+    sys.exit(1)
 
 
 def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
@@ -142,33 +143,24 @@ def ensure_keys_dir():
     KEYS_DIR.mkdir(parents=True, exist_ok=True)
 
 def generate_keypair() -> Tuple[bytes, bytes]:
-    """Generate ECDH keypair. Returns (private_bytes, public_bytes)."""
-    if HAS_ECDH:
-        sk = X25519PrivateKey.generate()
-        priv = sk.private_bytes(
-            serialization.Encoding.Raw,
-            serialization.PrivateFormat.Raw,
-            serialization.NoEncryption(),
-        )
-        pub = sk.public_key().public_bytes(
-            serialization.Encoding.Raw,
-            serialization.PublicFormat.Raw,
-        )
-        return priv, pub
-    else:
-        # Fallback: use random bytes as shared secret (less secure, no ECDH)
-        priv = os.urandom(32)
-        pub = hashlib.sha256(b"babel-pubkey-" + priv).digest()
-        return priv, pub
+    """Generate ECDH keypair (X25519). Returns (private_bytes, public_bytes)."""
+    sk = X25519PrivateKey.generate()
+    priv = sk.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    pub = sk.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    return priv, pub
 
 def compute_shared_secret(my_priv: bytes, peer_pub: bytes) -> bytes:
-    if HAS_ECDH:
-        sk = X25519PrivateKey.from_private_bytes(my_priv)
-        pk = X25519PublicKey.from_public_bytes(peer_pub)
-        return sk.exchange(pk)
-    else:
-        # Fallback: HKDF of concatenated keys
-        return hkdf_extract(my_priv, peer_pub)
+    """Compute ECDH shared secret (X25519)."""
+    sk = X25519PrivateKey.from_private_bytes(my_priv)
+    pk = X25519PublicKey.from_public_bytes(peer_pub)
+    return sk.exchange(pk)
 
 def encrypt_private_key(priv_bytes: bytes, passphrase: str) -> dict:
     """Encrypt a private key with PBKDF2 + AES-256-GCM."""
@@ -317,9 +309,7 @@ def save_config(cfg: dict):
 
 
 def get_session_id(ttl: int = 86400) -> int:
-    """Derive session ID based on TTL."""
-    if ttl >= 86400:
-        return int(time.strftime("%Y%m%d"))
+    """Derive session ID from UTC epoch, consistent across timezones."""
     return int(time.time()) // ttl
 
 
